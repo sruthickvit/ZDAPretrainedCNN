@@ -1,0 +1,354 @@
+
+
+import pandas as pd
+import numpy as np
+
+# --- 1. DEFINE SOURCE FEATURE ORDER AND MAPPING ---
+
+# The 36 features provided in your initial list (the source model input features).
+SOURCE_FEATURE_ORDER = [
+    'Variance', 'ack_flag_number', 'psh_flag_number', 'rst_count',
+    'Header_Length', 'Magnitue', 'TCP', 'UDP', 'Max', 'Protocol Type',
+    'Std', 'Radius', 'AVG', 'Tot size', 'Tot sum', 'syn_count', 'HTTPS',
+    'Srate', 'Rate', 'Covariance', 'Min', 'LLC', 'IPv', 'ARP', 'Duration',
+    'DNS', 'fin_flag_number', 'syn_flag_number', 'ack_count',
+    'rst_flag_number', 'fin_count', 'HTTP', 'IRC', 'SSH', 'SMTP', 'Telnet'
+]
+
+# Mapping dictionary: Key is the source feature, Value is the best equivalent in the 82-column list.
+# Uses the exact column names from your provided list.
+FEATURE_MAPPING = {
+    # Statistical / Timing
+    'Variance': 'flow_iat.std_SQUARED', # Calculated: Variance is Std Dev squared
+    'Std': 'flow_iat.std',
+    'Rate': 'flow_pkts_per_sec',
+    'Srate': 'fwd_pkts_per_sec',       # Srate (Source Rate) is Fwd Rate
+    'Duration': 'flow_duration',
+
+    # TCP Flag Counts (Mapping to flow-level counts)
+    'ack_flag_number': 'flow_ACK_flag_count',
+    'ack_count': 'flow_ACK_flag_count', # Redundant
+    'psh_flag_number': 'fwd_PSH_flag_count', # Using Fwd PSH as proxy for PSH flow count
+    'rst_count': 'flow_RST_flag_count',
+    'rst_flag_number': 'flow_RST_flag_count', # Redundant
+    'syn_count': 'flow_SYN_flag_count',
+    'syn_flag_number': 'flow_SYN_flag_count', # Redundant
+    'fin_count': 'flow_FIN_flag_count',
+    'fin_flag_number': 'flow_FIN_flag_count', # Redundant
+
+    # Size/Length/Bytes
+    'Header_Length': 'fwd_header_size_tot', # Using Fwd total header size as proxy
+    'Max': 'fwd_pkts_payload.max',      # Using Fwd max payload as proxy
+    'Min': 'fwd_pkts_payload.min',      # Using Fwd min payload as proxy
+    'Tot size': 'flow_pkts_payload.tot',  # Total payload bytes
+    'Tot sum': 'flow_pkts_payload.tot',   # Redundant
+    'AVG': 'CALCULATE_OVERALL_MEAN',    # Needs calculation
+
+    # Categorical Features (mapped to Zeek names)
+    'Protocol Type': 'proto',
+    'TCP': 'PROTO_TCP',
+    'UDP': 'PROTO_UDP',
+    'IPv': 'PROTO_IP',
+    'ARP': 'PROTO_ARP',
+    'HTTP': 'SERVICE_http',
+    'HTTPS': 'SERVICE_ssl',            # Zeek/Bro often uses 'ssl' for HTTPS
+    'DNS': 'SERVICE_dns',
+    'SSH': 'SERVICE_ssh',
+    'SMTP': 'SERVICE_smtp',
+    'IRC': 'SERVICE_irc',
+    'Telnet': 'SERVICE_telnet',
+
+    # Features to DROP (no clear equivalent) - These will be set to 0
+    'Magnitue': 'SET_TO_ZERO',
+    'Radius': 'SET_TO_ZERO',
+    'Covariance': 'SET_TO_ZERO',
+    'LLC': 'SET_TO_ZERO',
+}
+
+
+def create_transfer_dataframe(target_df):
+    """
+    Transforms the target DataFrame (82 columns) to match the feature list and order
+    of the source model (36 columns).
+    """
+    df = target_df.copy()
+
+    # --- STEP 1: CALCULATE DERIVED & MAPPED FEATURES ---
+
+    # 1.1 Calculate 'flow_iat.std_SQUARED' for 'Variance'
+    # Variance is the square of the Standard Deviation
+    # Ensure 'flow_iat.std' exists and handle potential NaNs before squaring
+    if 'flow_iat.std' in df.columns:
+        df['flow_iat.std_SQUARED'] = df['flow_iat.std'].fillna(0) ** 2
+    else:
+        df['flow_iat.std_SQUARED'] = 0 # Create the column and fill with 0 if source is missing
+
+    # 1.2 Calculate the overall flow mean payload ('AVG')
+    # Using 'flow_pkts_payload.tot' (Total Payload) and total packets (fwd + bwd)
+    # Ensure required columns exist and handle potential NaNs/division by zero
+    if 'fwd_pkts_tot' in df.columns and 'bwd_pkts_tot' in df.columns and 'flow_pkts_payload.tot' in df.columns:
+        df['Total_Flow_Packets'] = df['fwd_pkts_tot'].fillna(0) + df['bwd_pkts_tot'].fillna(0)
+        # Calculate Overall Mean Payload (Total Payload / Total Packets)
+        # Adding a small epsilon to avoid division by zero
+        df['OVERALL_PAYLOAD_MEAN'] = df['flow_pkts_payload.tot'].fillna(0) / (df['Total_Flow_Packets'].replace(0, np.nan) + 1e-6)
+        df['OVERALL_PAYLOAD_MEAN'] = df['OVERALL_PAYLOAD_MEAN'].fillna(0)
+    else:
+        df['OVERALL_PAYLOAD_MEAN'] = 0 # Create the column and fill with 0 if source is missing
+
+
+    # --- STEP 2: ONE-HOT ENCODING FOR CATEGORICAL FEATURES ---
+
+    # Creating One-Hot columns for the 'proto' and 'service' fields.
+    # Note: These exact service names ('http', 'dns', etc.) must exist in the 'service' column.
+
+    # Protocol Encoding (Based on typical Zeek/Bro names)
+    if 'proto' in df.columns:
+        df['PROTO_TCP'] = np.where(df['proto'].astype(str).str.lower() == 'tcp', 1, 0)
+        df['PROTO_UDP'] = np.where(df['proto'].astype(str).str.lower() == 'udp', 1, 0)
+        df['PROTO_ARP'] = np.where(df['proto'].astype(str).str.lower() == 'arp', 1, 0)
+        df['PROTO_IP'] = np.where(df['proto'].astype(str).str.lower().isin(['ip', 'ipv4', 'ipv6']), 1, 0)
+    else:
+        # Create columns and fill with 0 if source is missing
+        df['PROTO_TCP'] = 0
+        df['PROTO_UDP'] = 0
+        df['PROTO_ARP'] = 0
+        df['PROTO_IP'] = 0
+
+
+    # Service Encoding (Assuming standard service names)
+    if 'service' in df.columns:
+        df['SERVICE_http'] = np.where(df['service'].astype(str).str.lower() == 'http', 1, 0)
+        df['SERVICE_ssl'] = np.where(df['service'].astype(str).str.lower() == 'ssl', 1, 0)
+        df['SERVICE_dns'] = np.where(df['service'].astype(str).str.lower() == 'dns', 1, 0)
+        df['SERVICE_ssh'] = np.where(df['service'].astype(str).str.lower() == 'ssh', 1, 0)
+        df['SERVICE_smtp'] = np.where(df['service'].astype(str).str.lower() == 'smtp', 1, 0)
+        df['SERVICE_irc'] = np.where(df['service'].astype(str).str.lower() == 'irc', 1, 0)
+        df['SERVICE_telnet'] = np.where(df['service'].astype(str).str.lower() == 'telnet', 1, 0)
+    else:
+        # Create columns and fill with 0 if source is missing
+        df['SERVICE_http'] = 0
+        df['SERVICE_ssl'] = 0
+        df['SERVICE_dns'] = 0
+        df['SERVICE_ssh'] = 0
+        df['SERVICE_smtp'] = 0
+        df['SERVICE_irc'] = 0
+        df['SERVICE_telnet'] = 0
+
+
+    # --- STEP 3: CONSTRUCT THE FINAL MAPPED DATAFRAME IN ORDER ---
+
+    final_transfer_df = pd.DataFrame(index=df.index)
+
+    for source_name in SOURCE_FEATURE_ORDER:
+        target_name = FEATURE_MAPPING.get(source_name)
+
+        if target_name == 'SET_TO_ZERO':
+            final_transfer_df[source_name] = 0 # Set these specific source features to 0
+        elif source_name == 'AVG':
+            final_transfer_df[source_name] = df['OVERALL_PAYLOAD_MEAN']
+        elif source_name == 'Variance':
+             final_transfer_df[source_name] = df['flow_iat.std_SQUARED'] # Use the calculated squared std dev
+
+        # Handle Direct Mappings and One-Hot Encoded Columns
+        elif target_name in df.columns:
+            # Ensure the target column exists in the original or derived DataFrame
+            final_transfer_df[source_name] = df[target_name]
+        else:
+            # If a mapped column is expected but not found (e.g., missing due to data), fill with 0
+            print(f"Warning: Mapped target column '{target_name}' for source feature '{source_name}' not found. Filling with 0.")
+            final_transfer_df[source_name] = 0
+
+
+    return final_transfer_df
+
+
+# --- EXAMPLE USAGE ---
+
+# Create a mock DataFrame simulating the structure of your 82-column list
+
+target_df_mock = pd.read_csv("/content/RT_IOT2022Arp_norm.csv",skipinitialspace=True, low_memory=False )
+
+# Call the mapping function
+mapped_df = create_transfer_dataframe(target_df_mock)
+
+print("--- Final Mapped DataFrame for Model Transfer ---")
+print(f"Original features: {len(SOURCE_FEATURE_ORDER)}")
+print(f"Mapped features: {mapped_df.shape[1]}")
+print("\nCOLUMNS IN SOURCE ORDER:")
+print(mapped_df.columns.tolist())
+print("\nDATA (First 5 Rows):")
+print(mapped_df.head())
+
+import numpy as np
+mapped_df.replace([np.inf, -np.inf], np.nan, inplace=True)
+mapped_df=mapped_df.dropna()
+
+#train.drop(['label'], axis=1, inplace=True)
+import pandas as pd
+from sklearn.preprocessing import LabelEncoder
+
+# Identify categorical columns
+categorical_cols = mapped_df.select_dtypes(include=['object']).columns
+
+# Apply Label Encoding to each categorical column
+for col in categorical_cols:
+    le = LabelEncoder()
+    mapped_df[col] = le.fit_transform(mapped_df[col])
+
+y_test=target_df_mock['Attack_Type']
+# Convert categorical labels to numerical using LabelEncoder
+
+#y_train=y_train.astype(float)
+
+X_test=mapped_df
+#X_train=train.drop('attack', axis=1)
+
+
+from imblearn.over_sampling import SMOTE
+def balance_dataset(X, y):
+    smote = SMOTE(random_state=42)
+    X_balanced, y_balanced = smote.fit_resample(X, y)
+
+    return X_balanced, y_balanced
+(X_test,y_test)=balance_dataset(X_test, y_test)
+
+
+
+os.chdir("C:/Users/lenovo/")
+# Check if the directory exists, if not create it
+if not os.path.exists("download2"):
+    os.makedirs("download2")
+
+# Change the current working directory
+os.chdir("download2")
+
+
+# Convert the mitmds array to uint8
+X_test = X_test.astype(np.uint8)
+
+# Iterate over each element in the mitmds array
+for i in range(X_test.shape[0]):
+    if y_test.iloc[i]==0:
+        binary_values = np.unpackbits(X_test.iloc[i].values.view(np.uint8))
+
+    # Group the bits into 8-bit chunks
+        grouped_values = np.packbits(binary_values.reshape(-1, 8))
+
+    # Determine the dimensions of the image (assuming a square image)
+        image_size = int(np.ceil(np.sqrt(len(grouped_values))))
+
+    # Pad the grouped values with zeros to make a square image
+        padded_values = np.pad(grouped_values, (0, image_size**2 - len(grouped_values)), 'constant')
+
+    # Reshape the padded values into a 2D image array
+        image_data = padded_values.reshape(image_size, image_size)
+
+    # Create an image from the array and save it
+        image = Image.fromarray(image_data, mode='L')
+        image.save(f'Normal.{i}.jpg',"JPEG")
+
+
+
+os.chdir("C:/Users/lenovo/")
+# Check if the directory exists, if not create it
+if not os.path.exists("download2"):
+    os.makedirs("download2")
+
+# Change the current working directory
+os.chdir("download2")
+
+
+# Convert the mitmds array to uint8
+X_test = X_test.astype(np.uint8)
+
+# Iterate over each element in the mitmds array
+for i in range(X_test.shape[0]):
+    if y_test.iloc[i]==1:
+        binary_values = np.unpackbits(X_test.iloc[i].values.view(np.uint8))
+
+    # Group the bits into 8-bit chunks
+        grouped_values = np.packbits(binary_values.reshape(-1, 8))
+
+    # Determine the dimensions of the image (assuming a square image)
+        image_size = int(np.ceil(np.sqrt(len(grouped_values))))
+
+    # Pad the grouped values with zeros to make a square image
+        padded_values = np.pad(grouped_values, (0, image_size**2 - len(grouped_values)), 'constant')
+
+    # Reshape the padded values into a 2D image array
+        image_data = padded_values.reshape(image_size, image_size)
+
+    # Create an image from the array and save it
+        image = Image.fromarray(image_data, mode='L')
+        image.save(f'Attack.{i}.jpg',"JPEG")
+
+test_img_dir_n = "C:/Users/lenovo/download2"
+#train_img_dir_n =train_img_dir_n [:1000]
+test_img_paths_n = [os.path.join(test_img_dir_n,filename) for filename in os.listdir(test_img_dir_n)]
+
+import re
+
+test_path_df = pd.DataFrame({
+    'path': [],
+    'target': []
+})
+
+for path in test_img_paths_n:
+    pattern = r'Normal'
+
+    match = re.search(pattern, path)
+
+    if match:
+        test_path_df = pd.concat([test_path_df, pd.DataFrame({'path': [path], 'target': [0]})], ignore_index=True)
+    else:
+        test_path_df = pd.concat([test_path_df, pd.DataFrame({'path': [path], 'target': [1]})], ignore_index=True)
+
+test_path_df['target'] = test_path_df['target'].astype(str)
+
+test_image_generator = datagen.flow_from_dataframe(
+    test_path_df,
+    x_col='path',
+    y_col='target',
+    target_size=(75,75),  # Adjust to match your model's input size
+    #batch_size=32,
+    class_mode='binary',  # Change to 'binary' if you have binary classes
+    shuffle=False,
+    color_mode='rgb'
+)
+
+
+import numpy as np
+from sklearn.metrics import accuracy_score, classification_report, roc_auc_score
+from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
+import matplotlib.pyplot as plt
+#checkpoint_filepath = 'c:/users/lenovo/rtiotdosddos2_12_24.weights.h5'
+#model.load_weights(checkpoint_filepath)
+predictions = model.predict(test_image_generator)
+
+best_accuracy = 0
+best_threshold = 0
+best_report = ""
+
+# Calculate ROC AUC directly
+true_labels = test_image_generator.classes  # Get true labels once outside the loop
+roc_auc = roc_auc_score(true_labels, predictions)  # Use roc_auc_score
+
+for threshold in np.arange(0.1, 1.0, 0.1):
+    predicted_labels = (predictions > threshold).astype(int)
+
+    accuracy = accuracy_score(true_labels, predicted_labels)
+
+    if accuracy > best_accuracy:
+        best_accuracy = accuracy
+        best_threshold = threshold
+        best_report = classification_report(true_labels, predicted_labels)
+        cm = confusion_matrix(true_labels, predicted_labels)
+
+print(f"Best Accuracy: {best_accuracy} at Threshold: {best_threshold}")
+print(f"ROC AUC: {roc_auc}")  # Print ROC AUC
+print("Best Classification Report:\n", best_report)
+disp = ConfusionMatrixDisplay(confusion_matrix=cm)
+disp.plot()
+plt.show()
+
+
